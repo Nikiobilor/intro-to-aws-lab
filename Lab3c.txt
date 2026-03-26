@@ -1,0 +1,1044 @@
+# 🏗️ AWS Networking Lab — CLB + ASG + Public & Private EC2 with Nginx
+
+> **Course:** Cloud Foundations  
+> **Difficulty:** Beginner–Intermediate  
+> **Duration:** ~2 hours  
+> **OS:** Ubuntu Server 22.04 LTS  
+> **Services Used:** VPC · Subnets · IGW · NAT Gateway · Security Groups · Route Tables · Launch Template · Auto Scaling Group · Classic Load Balancer · EC2
+
+---
+
+## 📋 Table of Contents
+
+1. [Overview](#overview)
+2. [Architecture Diagram](#architecture-diagram)
+3. [What You Will Build](#what-you-will-build)
+4. [Prerequisites](#prerequisites)
+5. [Part 1 — Create the VPC and Subnets](#part-1--create-the-vpc-and-subnets)
+6. [Part 2 — Internet Gateway and NAT Gateway](#part-2--internet-gateway-and-nat-gateway)
+7. [Part 3 — Configure Route Tables](#part-3--configure-route-tables)
+8. [Part 4 — Create Security Groups](#part-4--create-security-groups)
+9. [Part 5 — Create the Launch Template with Nginx User Data](#part-5--create-the-launch-template-with-nginx-user-data)
+10. [Part 6 — Create the Auto Scaling Group](#part-6--create-the-auto-scaling-group)
+11. [Part 7 — Create the Classic Load Balancer](#part-7--create-the-classic-load-balancer)
+12. [Part 8 — Launch the Private EC2 Instance](#part-8--launch-the-private-ec2-instance)
+13. [Part 9 — SSH into Private EC2 and Set Up Nginx](#part-9--ssh-into-private-ec2-and-set-up-nginx)
+14. [Part 10 — Test the Full Traffic Flow](#part-10--test-the-full-traffic-flow)
+15. [Troubleshooting Guide](#troubleshooting-guide)
+16. [Lab Submission Checklist](#lab-submission-checklist)
+17. [Clean Up (IMPORTANT)](#clean-up-important)
+
+---
+
+## Overview
+
+In this lab, you will build a **two-tier AWS architecture** from scratch that mirrors real-world production setups. Here is what you will accomplish:
+
+- Build a custom **VPC** with two public subnets and one private subnet
+- Create an **Internet Gateway** (IGW) for inbound internet traffic
+- Create a **NAT Gateway** so the private instance can download packages
+- Write a **User Data script** that automatically installs and configures **Nginx** when EC2 instances launch
+- Use a **Launch Template** + **Auto Scaling Group (ASG)** to automatically spin up **2 public EC2 instances** running Nginx
+- Attach a **Classic Load Balancer (CLB)** to distribute traffic across the 2 public EC2 instances
+- Launch a **private EC2 instance** (Ubuntu) and manually install **Nginx** to serve a custom HTML page
+- Configure the public EC2 instances to act as **reverse proxies** — forwarding browser traffic from the CLB to the private Nginx server
+
+### Traffic Flow
+```
+User's Browser
+      ↓
+Internet Gateway (IGW)
+      ↓
+Classic Load Balancer (CLB)  ←── distributes across 2 public EC2s
+      ↓
+Public EC2 #1 or #2 (Nginx reverse proxy)
+      ↓
+Private EC2 (Nginx web server — serves the HTML page)
+```
+
+> The private EC2 has **no public IP**. All inbound traffic must pass through the CLB and the public EC2s. The NAT Gateway gives the private EC2 outbound internet access only (to install packages).
+
+---
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        AWS VPC (10.0.0.0/16)                    │
+│                                                                  │
+│  ┌──────────────────────────┐  ┌──────────────────────────┐    │
+│  │  Public Subnet A         │  │  Public Subnet B         │    │
+│  │  10.0.1.0/24             │  │  10.0.2.0/24             │    │
+│  │  (us-east-1a)            │  │  (us-east-1b)            │    │
+│  │                          │  │                          │    │
+│  │  ┌────────────────┐      │  │  ┌────────────────┐      │    │
+│  │  │ Public EC2 #1  │      │  │  │ Public EC2 #2  │      │    │
+│  │  │ (Nginx Proxy)  │      │  │  │ (Nginx Proxy)  │      │    │
+│  │  │ [ASG managed]  │      │  │  │ [ASG managed]  │      │    │
+│  │  └────────────────┘      │  │  └────────────────┘      │    │
+│  │         ↑                │  │         ↑                │    │
+│  │    NAT Gateway           │  │                          │    │
+│  └──────────────────────────┘  └──────────────────────────┘    │
+│           ↑                              ↑                      │
+│           └──────────┬───────────────────┘                      │
+│                      ↑                                          │
+│            Classic Load Balancer (CLB)                          │
+│                      ↑                                          │
+│            Internet Gateway (IGW)                               │
+│                      ↑                                          │
+│  ┌──────────────────────────────────────┐                       │
+│  │  Private Subnet                      │                       │
+│  │  10.0.3.0/24  (us-east-1a)          │                       │
+│  │                                      │                       │
+│  │  ┌────────────────────────────┐      │                       │
+│  │  │ Private EC2                │      │                       │
+│  │  │ (Nginx — serves HTML page) │      │                       │
+│  │  └────────────────────────────┘      │                       │
+│  └──────────────────────────────────────┘                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## What You Will Build
+
+| Resource | Name | Value |
+|---|---|---|
+| VPC | `MyLabVPC` | 10.0.0.0/16 |
+| Public Subnet A | `PublicSubnetA` | 10.0.1.0/24 — us-east-1a |
+| Public Subnet B | `PublicSubnetB` | 10.0.2.0/24 — us-east-1b |
+| Private Subnet | `PrivateSubnet` | 10.0.3.0/24 — us-east-1a |
+| Internet Gateway | `MyLabIGW` | Attached to VPC |
+| NAT Gateway | `MyLabNATGW` | In PublicSubnetA |
+| Elastic IP | — | For NAT Gateway |
+| Public Route Table | `PublicRT` | Routes to IGW |
+| Private Route Table | `PrivateRT` | Routes to NAT GW |
+| Security Group (CLB) | `CLBSG` | Allows HTTP 80 from internet |
+| Security Group (Public EC2) | `PublicEC2SG` | Allows HTTP from CLB, SSH from internet |
+| Security Group (Private EC2) | `PrivateEC2SG` | Allows HTTP/SSH from public EC2s only |
+| Launch Template | `NginxLaunchTemplate` | Ubuntu + Nginx user data |
+| Auto Scaling Group | `MyLabASG` | Min: 2, Max: 2, Desired: 2 |
+| Classic Load Balancer | `MyLabCLB` | HTTP listener on port 80 |
+| Private EC2 | `PrivateEC2` | Ubuntu — Nginx web server |
+
+---
+
+## Prerequisites
+
+Before starting, make sure you have:
+
+- ✅ An active **AWS account**
+- ✅ An **SSH client** — Terminal (Mac/Linux), WSL or PowerShell (Windows)
+- ✅ Basic ability to navigate the **AWS Management Console**
+- ✅ Your AWS **region set to us-east-1** (N. Virginia) — check the top-right corner of the console
+- ✅ A **key pair (.pem file)** — if you do not have one, go to EC2 → Key Pairs → Create key pair, download the `.pem` file and keep it safe
+
+> ⚠️ **Cost Warning:** This lab uses a NAT Gateway and a Classic Load Balancer, which are **not free tier**. Charges are small but will apply. Always follow the cleanup steps at the end to delete all resources.
+
+---
+
+## Part 1 — Create the VPC and Subnets
+
+### What is a VPC?
+A **Virtual Private Cloud (VPC)** is your own private, isolated network inside AWS. Every resource you create in this lab will live inside this VPC.
+
+---
+
+### Step 1 — Create the VPC
+
+1. In the AWS Console search bar, type **VPC** and click **VPC** under Services
+2. In the left sidebar, click **Your VPCs**
+3. Click **Create VPC**
+4. Fill in the form:
+
+```
+Resources to create:    VPC only
+Name tag:               MyLabVPC
+IPv4 CIDR block:        10.0.0.0/16
+IPv6 CIDR block:        No IPv6 CIDR block
+Tenancy:                Default
+```
+
+5. Click **Create VPC**
+
+> 💡 The CIDR `10.0.0.0/16` gives you 65,536 IP addresses to divide across your subnets.
+
+---
+
+### Step 2 — Create Public Subnet A
+
+The CLB and Auto Scaling Group require **at least 2 subnets in different Availability Zones**.
+
+1. In the left sidebar, click **Subnets**
+2. Click **Create subnet**
+3. Under **VPC ID**, select `MyLabVPC`
+4. Fill in:
+
+```
+Subnet name:              PublicSubnetA
+Availability Zone:        us-east-1a
+IPv4 subnet CIDR block:   10.0.1.0/24
+```
+
+5. Click **Create subnet**
+
+---
+
+### Step 3 — Create Public Subnet B
+
+1. Click **Create subnet** again
+2. Select `MyLabVPC`
+3. Fill in:
+
+```
+Subnet name:              PublicSubnetB
+Availability Zone:        us-east-1b
+IPv4 subnet CIDR block:   10.0.2.0/24
+```
+
+4. Click **Create subnet**
+
+> ⚠️ **Important:** PublicSubnetA and PublicSubnetB must be in **different Availability Zones** (1a and 1b). The Classic Load Balancer requires this.
+
+---
+
+### Step 4 — Create the Private Subnet
+
+1. Click **Create subnet** again
+2. Select `MyLabVPC`
+3. Fill in:
+
+```
+Subnet name:              PrivateSubnet
+Availability Zone:        us-east-1a
+IPv4 subnet CIDR block:   10.0.3.0/24
+```
+
+4. Click **Create subnet**
+
+---
+
+### Step 5 — Enable Auto-Assign Public IPs on Both Public Subnets
+
+Do this for **both** PublicSubnetA and PublicSubnetB:
+
+1. Check the box next to **PublicSubnetA**
+2. Click **Actions** → **Edit subnet settings**
+3. Check **Enable auto-assign public IPv4 address**
+4. Click **Save**
+5. Repeat for **PublicSubnetB**
+
+> 💡 This ensures EC2 instances launched into the public subnets automatically receive a public IP address.
+
+---
+
+## Part 2 — Internet Gateway and NAT Gateway
+
+### What is the difference?
+
+| Gateway | Purpose |
+|---|---|
+| **Internet Gateway (IGW)** | Allows inbound AND outbound internet traffic for public subnets |
+| **NAT Gateway** | Allows OUTBOUND-only internet traffic for the private subnet (e.g., to install packages) — blocks all inbound connections |
+
+---
+
+### Step 6 — Create and Attach the Internet Gateway
+
+1. In the left sidebar, click **Internet gateways**
+2. Click **Create internet gateway**
+3. Set Name tag: `MyLabIGW`
+4. Click **Create internet gateway**
+5. On the next screen, click **Attach to a VPC**
+6. Select `MyLabVPC`
+7. Click **Attach internet gateway**
+
+> You should see the state change from **Detached** to **Attached**.
+
+---
+
+### Step 7 — Allocate an Elastic IP for the NAT Gateway
+
+1. In the left sidebar, scroll down and click **Elastic IPs**
+2. Click **Allocate Elastic IP address**
+3. Leave all defaults and click **Allocate**
+4. Note the IP address that appears — you will use it in the next step
+
+---
+
+### Step 8 — Create the NAT Gateway
+
+1. In the left sidebar, click **NAT gateways**
+2. Click **Create NAT gateway**
+3. Fill in:
+
+```
+Name:             MyLabNATGW
+Subnet:           PublicSubnetA   ← MUST be a public subnet
+Connectivity:     Public
+Elastic IP:       Select the Elastic IP you just allocated
+```
+
+4. Click **Create NAT gateway**
+
+> ⏳ Wait until the NAT Gateway status shows **Available** (about 1–2 minutes) before continuing.
+
+---
+
+## Part 3 — Configure Route Tables
+
+Route tables tell AWS where to send network traffic. You need two:
+- **PublicRT** — sends traffic to the IGW (for public subnets)
+- **PrivateRT** — sends traffic to the NAT Gateway (for the private subnet)
+
+---
+
+### Step 9 — Create and Configure the Public Route Table
+
+1. In the left sidebar, click **Route tables**
+2. Click **Create route table**
+3. Fill in:
+
+```
+Name:    PublicRT
+VPC:     MyLabVPC
+```
+
+4. Click **Create route table**
+5. With **PublicRT** selected, click the **Routes** tab → **Edit routes**
+6. Click **Add route**:
+
+```
+Destination:    0.0.0.0/0
+Target:         Internet Gateway → MyLabIGW
+```
+
+7. Click **Save changes**
+8. Click the **Subnet associations** tab → **Edit subnet associations**
+9. Check both **PublicSubnetA** and **PublicSubnetB**
+10. Click **Save associations**
+
+---
+
+### Step 10 — Create and Configure the Private Route Table
+
+1. Click **Create route table**
+2. Fill in:
+
+```
+Name:    PrivateRT
+VPC:     MyLabVPC
+```
+
+3. Click **Create route table**
+4. Click the **Routes** tab → **Edit routes** → **Add route**:
+
+```
+Destination:    0.0.0.0/0
+Target:         NAT Gateway → MyLabNATGW
+```
+
+5. Click **Save changes**
+6. Click **Subnet associations** tab → **Edit subnet associations**
+7. Check **PrivateSubnet**
+8. Click **Save associations**
+
+> 💡 The private subnet's traffic goes to the NAT Gateway — not the IGW. This means the private EC2 can reach the internet to install software, but no one from the internet can connect directly to it.
+
+---
+
+## Part 4 — Create Security Groups
+
+Security groups are virtual firewalls. You will create three:
+
+| Security Group | Purpose |
+|---|---|
+| `CLBSG` | Allows internet traffic into the Classic Load Balancer |
+| `PublicEC2SG` | Allows the CLB to reach public EC2s; allows your SSH access |
+| `PrivateEC2SG` | Allows only the public EC2s to reach the private EC2 |
+
+---
+
+### Step 11 — Create the CLB Security Group (CLBSG)
+
+1. In the left sidebar, click **Security Groups**
+2. Click **Create security group**
+3. Fill in:
+
+```
+Security group name:    CLBSG
+Description:           Allows HTTP traffic from the internet to the CLB
+VPC:                   MyLabVPC
+```
+
+4. Under **Inbound rules**, click **Add rule**:
+
+| Type | Protocol | Port | Source |
+|---|---|---|---|
+| HTTP | TCP | 80 | 0.0.0.0/0 |
+
+5. Leave **Outbound rules** as default (All traffic allowed)
+6. Click **Create security group**
+
+---
+
+### Step 12 — Create the Public EC2 Security Group (PublicEC2SG)
+
+1. Click **Create security group**
+2. Fill in:
+
+```
+Security group name:    PublicEC2SG
+Description:           Allows HTTP from CLB and SSH from internet
+VPC:                   MyLabVPC
+```
+
+3. Under **Inbound rules**, add **two rules**:
+
+| Type | Protocol | Port | Source |
+|---|---|---|---|
+| HTTP | TCP | 80 | Custom → select `CLBSG` |
+| SSH | TCP | 22 | 0.0.0.0/0 (or your IP) |
+
+4. Click **Create security group**
+
+> 💡 Setting the HTTP source to `CLBSG` means only the load balancer can send web traffic to the public EC2s — not random internet users connecting directly.
+
+---
+
+### Step 13 — Create the Private EC2 Security Group (PrivateEC2SG)
+
+1. Click **Create security group**
+2. Fill in:
+
+```
+Security group name:    PrivateEC2SG
+Description:           Allows HTTP and SSH only from public EC2s
+VPC:                   MyLabVPC
+```
+
+3. Under **Inbound rules**, add **two rules**:
+
+| Type | Protocol | Port | Source |
+|---|---|---|---|
+| HTTP | TCP | 80 | Custom → select `PublicEC2SG` |
+| SSH | TCP | 22 | Custom → select `PublicEC2SG` |
+
+4. Click **Create security group**
+
+> 💡 This is a critical security rule. The private EC2 only accepts connections from instances in `PublicEC2SG` — meaning only your public EC2s can reach it. Nothing from the internet can connect directly.
+
+---
+
+## Part 5 — Create the Launch Template with Nginx User Data
+
+A **Launch Template** is a saved configuration for EC2 instances. The Auto Scaling Group will use this template to automatically spin up your 2 public EC2 instances. The key feature here is the **User Data script** — a set of commands that run automatically when each instance first boots up, installing and configuring Nginx without any manual steps.
+
+---
+
+### Step 14 — Create the Launch Template
+
+1. In the AWS Console, go to **EC2**
+2. In the left sidebar, click **Launch Templates**
+3. Click **Create launch template**
+4. Fill in the **Launch template name and description**:
+
+```
+Launch template name:      NginxLaunchTemplate
+Template version description: Public EC2 with Nginx reverse proxy
+```
+
+5. Under **Application and OS Images (Amazon Machine Image)**, click **Browse more AMIs**
+6. Search for **Ubuntu** and select:
+
+```
+Ubuntu Server 22.04 LTS (HVM), SSD Volume Type
+Architecture: 64-bit (x86)
+```
+
+> Make sure you select the **free tier eligible** Ubuntu 22.04 AMI.
+
+7. Under **Instance type**, select: `t2.micro`
+
+8. Under **Key pair (login)**, select your existing key pair
+
+9. Under **Network settings**:
+   - Do NOT specify a subnet here (the ASG will handle subnet placement)
+   - Under **Firewall (security groups)**, select **Select existing security group**
+   - Choose `PublicEC2SG`
+
+10. Scroll down to **Advanced details**
+11. Scroll to the very bottom to find the **User data** text box
+12. Paste the following script into the User data box:
+
+```bash
+#!/bin/bash
+
+# Update the system
+apt-get update -y
+apt-get upgrade -y
+
+# Install Nginx
+apt-get install -y nginx
+
+# Start and enable Nginx
+systemctl start nginx
+systemctl enable nginx
+
+# Get the private IP of this instance for display
+PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+
+# Create a simple status page (optional — for testing which EC2 is being hit)
+cat > /var/www/html/index.html << EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Public EC2 - Proxy Node</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #1a3c5e; color: white;
+               display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .card { background: #2e6da4; padding: 30px 50px; border-radius: 10px; text-align: center; }
+        .badge { background: #e07b2a; padding: 5px 15px; border-radius: 15px; margin-top: 15px; display: inline-block; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>Public EC2 Proxy Node</h2>
+        <p>Instance ID: <strong>${INSTANCE_ID}</strong></p>
+        <p>Private IP: <strong>${PRIVATE_IP}</strong></p>
+        <div class="badge">This page is served by the Public EC2 directly</div>
+    </div>
+</body>
+</html>
+EOF
+
+# Ensure Nginx is running
+systemctl restart nginx
+```
+
+> 💡 **What does User Data do?**  
+> When an EC2 instance first boots, AWS runs the User Data script automatically as the root user. This means every instance the ASG creates will automatically have Nginx installed and running — without you having to SSH in and set it up manually. This is called **bootstrapping**.
+
+13. Click **Create launch template**
+
+---
+
+## Part 6 — Create the Auto Scaling Group
+
+An **Auto Scaling Group (ASG)** uses the Launch Template to automatically launch and manage EC2 instances. You will configure it to always maintain exactly **2 running instances** across the two public subnets.
+
+---
+
+### Step 15 — Create the Auto Scaling Group
+
+1. In the left sidebar, click **Auto Scaling Groups**
+2. Click **Create Auto Scaling group**
+
+**Step 1 — Choose launch template:**
+```
+Auto Scaling group name:    MyLabASG
+Launch template:            NginxLaunchTemplate
+Version:                    Default (1)
+```
+Click **Next**
+
+**Step 2 — Choose instance launch options:**
+```
+VPC:        MyLabVPC
+Subnets:    PublicSubnetA, PublicSubnetB  (select both)
+```
+Click **Next**
+
+**Step 3 — Configure advanced options:**
+- Under **Load balancing**, select **Attach to an existing load balancer**
+
+> ⚠️ If you have not created the CLB yet, select **No load balancer** for now and come back to attach it after Step 16. Skip this for now and continue.
+
+- Leave everything else as default
+- Click **Next**
+
+**Step 4 — Configure group size and scaling:**
+```
+Desired capacity:    2
+Minimum capacity:    2
+Maximum capacity:    2
+```
+
+> Setting min, max, and desired all to **2** means the ASG will always maintain exactly 2 instances — no more, no less.
+
+Click **Next** through the remaining steps, then click **Create Auto Scaling group**
+
+> ⏳ Wait about 2 minutes. Go to **EC2 → Instances** and you should see **2 new instances** launching automatically — both running Nginx from your User Data script.
+
+---
+
+## Part 7 — Create the Classic Load Balancer
+
+A **Classic Load Balancer (CLB)** distributes incoming HTTP traffic evenly across your 2 public EC2 instances. It is the entry point for all web traffic.
+
+---
+
+### Step 16 — Create the Classic Load Balancer
+
+1. In the left sidebar, click **Load Balancers**
+2. Click **Create load balancer**
+3. Under **Classic Load Balancer**, click **Create**
+4. Fill in:
+
+```
+Load balancer name:    MyLabCLB
+Scheme:                Internet-facing
+```
+
+5. Under **Network mapping**:
+```
+VPC:        MyLabVPC
+Mappings:   Check both us-east-1a (PublicSubnetA) and us-east-1b (PublicSubnetB)
+```
+
+6. Under **Security groups**, select `CLBSG`
+
+7. Under **Listeners and routing**:
+```
+Protocol:           HTTP
+Load Balancer Port: 80
+Instance Protocol:  HTTP
+Instance Port:      80
+```
+
+8. Under **Health checks**:
+```
+Ping Protocol:     HTTP
+Ping Port:         80
+Ping Path:         /
+```
+
+9. Under **Add EC2 Instances** — leave this empty for now. The ASG will register the instances automatically once connected.
+
+10. Click **Create load balancer**
+
+---
+
+### Step 17 — Attach the CLB to the Auto Scaling Group
+
+Now link the CLB to the ASG so traffic is automatically routed to the EC2 instances:
+
+1. Go to **EC2 → Auto Scaling Groups**
+2. Click on `MyLabASG`
+3. Click the **Load balancing** tab
+4. Click **Edit**
+5. Under **Classic load balancers**, check `MyLabCLB`
+6. Click **Update**
+
+> ⏳ Give it 1–2 minutes. Go to **EC2 → Load Balancers → MyLabCLB → Instances tab** and you should see both EC2 instances with status **InService**.
+
+---
+
+## Part 8 — Launch the Private EC2 Instance
+
+This instance lives in the private subnet and will run the actual Nginx web server that serves your HTML page. It has **no public IP** — the only way to reach it is through the public EC2s.
+
+---
+
+### Step 18 — Launch the Private EC2
+
+1. Go to **EC2 → Instances → Launch instances**
+2. Fill in:
+
+```
+Name:                     PrivateEC2
+AMI:                      Ubuntu Server 22.04 LTS
+Instance type:            t2.micro
+Key pair:                 Select your key pair
+
+Network settings (click Edit):
+  VPC:                    MyLabVPC
+  Subnet:                 PrivateSubnet
+  Auto-assign public IP:  Disable
+  Security group:         PrivateEC2SG
+```
+
+3. Click **Launch instance**
+
+> 📝 **Write down the Private IP address** of PrivateEC2 after it launches (e.g. `10.0.3.xxx`). You will need this IP address in the next step.
+
+---
+
+## Part 9 — SSH into Private EC2 and Set Up Nginx
+
+Since the private EC2 has no public IP, you cannot SSH into it directly. You will SSH into one of the public EC2s first, copy your key there using SCP, and then jump into the private EC2.
+
+---
+
+### Step 19 — Set Up SSH Access (Mac / Linux / WSL)
+
+**On your local machine**, run:
+
+```bash
+# Step 1: Make sure your key has the right permissions
+chmod 400 ~/your-key-name.pem
+
+# Step 2: SSH into one of the public EC2 instances
+# Get the Public IPv4 address from EC2 → Instances → select PublicEC2 #1
+ssh -i ~/your-key-name.pem ubuntu@PUBLIC_EC2_IP
+```
+
+> ⚠️ For Ubuntu AMIs, the username is **`ubuntu`**, NOT `ec2-user`.
+
+---
+
+### Step 20 — Copy the Key to the Public EC2 Using SCP
+
+Open a **second terminal window** on your local machine and run:
+
+```bash
+# Copy your .pem file to the public EC2's home directory
+scp -i ~/your-key-name.pem ~/your-key-name.pem ubuntu@PUBLIC_EC2_IP:~/
+```
+
+You should see output like:
+```
+your-key-name.pem    100% 1678    xx.x KB/s   00:00
+```
+
+---
+
+### Step 21 — Jump into the Private EC2
+
+Switch back to the first terminal (connected to the public EC2) and run:
+
+```bash
+# Set correct permissions on the copied key
+chmod 400 ~/your-key-name.pem
+
+# SSH into the private EC2
+# Replace PRIVATE_EC2_IP with the actual private IP (e.g. 10.0.3.xxx)
+ssh -i ~/your-key-name.pem ubuntu@PRIVATE_EC2_IP
+```
+
+Your prompt should change to something like:
+```
+ubuntu@ip-10-0-3-xxx:~$
+```
+
+Confirm you are on the right machine:
+```bash
+hostname -I
+# Should show a 10.0.3.xxx address
+```
+
+---
+
+### Step 22 — Install Nginx on the Private EC2
+
+Run the following commands on the **Private EC2**:
+
+```bash
+# Update packages
+sudo apt-get update -y
+sudo apt-get upgrade -y
+
+# Install Nginx
+sudo apt-get install -y nginx
+
+# Start and enable Nginx
+sudo systemctl start nginx
+sudo systemctl enable nginx
+
+# Verify Nginx is running (look for 'active (running)')
+sudo systemctl status nginx
+```
+
+Press `Q` to exit the status view.
+
+---
+
+### Step 23 — Create the HTML Web Page on the Private EC2
+
+Run this entire block as one command:
+
+```bash
+sudo bash -c 'cat > /var/www/html/index.html << EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Private EC2 — Lab Web Page</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #1a3c5e 0%, #0d2137 100%);
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .card {
+            background: rgba(46, 109, 164, 0.85);
+            padding: 50px 70px;
+            border-radius: 16px;
+            text-align: center;
+            box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+            max-width: 600px;
+        }
+        h1 { font-size: 2.2em; margin-bottom: 12px; }
+        .subtitle { font-size: 1.1em; color: #a8d4f5; margin-bottom: 24px; }
+        .path {
+            background: rgba(0,0,0,0.3);
+            padding: 14px 20px;
+            border-radius: 8px;
+            font-size: 0.95em;
+            color: #d6e8f7;
+            margin-bottom: 24px;
+            line-height: 1.8;
+        }
+        .badge {
+            display: inline-block;
+            background: #e07b2a;
+            color: white;
+            padding: 8px 22px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 1em;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>🔒 Hello from the Private EC2!</h1>
+        <p class="subtitle">This page is served by <strong>Nginx</strong> running in a <strong>private subnet</strong></p>
+        <div class="path">
+            <strong>Traffic Path:</strong><br>
+            🌐 Internet<br>
+            ↓<br>
+            🔌 Internet Gateway (IGW)<br>
+            ↓<br>
+            ⚖️ Classic Load Balancer (CLB)<br>
+            ↓<br>
+            🖥️ Public EC2 (Nginx Reverse Proxy)<br>
+            ↓<br>
+            🔒 Private EC2 — You are here!
+        </div>
+        <div class="badge">AWS Networking Lab Complete 🎉</div>
+    </div>
+</body>
+</html>
+EOF'
+```
+
+---
+
+### Step 24 — Verify Nginx is Serving the Page
+
+While still on the **Private EC2**, run:
+
+```bash
+curl http://localhost
+```
+
+You should see your HTML code printed in the terminal. This confirms Nginx is working correctly on the private instance.
+
+---
+
+### Step 25 — Configure Reverse Proxy on the Public EC2s
+
+Now you need to configure the Nginx on **each public EC2** to forward traffic to the private EC2.
+
+Type `exit` to return to the public EC2, then run:
+
+```bash
+# Create the reverse proxy config
+# Replace 10.0.3.xxx with your actual Private EC2 IP
+sudo bash -c 'cat > /etc/nginx/sites-available/proxy.conf << EOF
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+    location / {
+        proxy_pass http://PRIVATE_EC2_IP;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+}
+EOF'
+
+# Enable the config by linking it
+sudo ln -sf /etc/nginx/sites-available/proxy.conf /etc/nginx/sites-enabled/default
+
+# Test the Nginx configuration
+sudo nginx -t
+
+# Reload Nginx to apply changes
+sudo systemctl reload nginx
+```
+
+> ⚠️ **Replace `PRIVATE_EC2_IP`** with the actual private IP of your PrivateEC2 (e.g. `10.0.3.239`) before running the command.
+
+You should see:
+```
+nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+nginx: configuration file /etc/nginx/nginx.conf test is successful
+```
+
+**Repeat this step on the second public EC2 as well.** SSH into the second public EC2 instance and run the same reverse proxy configuration commands.
+
+---
+
+## Part 10 — Test the Full Traffic Flow
+
+### Step 26 — Find the CLB DNS Name
+
+1. Go to **EC2 → Load Balancers**
+2. Click on `MyLabCLB`
+3. In the **Description** tab, copy the **DNS name** — it looks like:
+
+```
+MyLabCLB-xxxxxxxxxxxx.us-east-1.elb.amazonaws.com
+```
+
+---
+
+### Step 27 — Open the Web Page in Your Browser
+
+Paste the CLB DNS name into your browser:
+
+```
+http://MyLabCLB-xxxxxxxxxxxx.us-east-1.elb.amazonaws.com
+```
+
+You should see your styled HTML page with the message **"Hello from the Private EC2!"**
+
+> 💡 **What just happened?**
+> 1. Your browser sent a request to the CLB DNS name
+> 2. The CLB forwarded it to one of the 2 public EC2s (round-robin)
+> 3. The public EC2's Nginx reverse proxy forwarded it to the private EC2
+> 4. The private EC2's Nginx served the HTML page back through the chain
+
+---
+
+### Step 28 — Verify Load Balancing is Working
+
+Refresh the browser several times. You can verify which public EC2 is handling each request by checking the Nginx access logs on each public instance:
+
+```bash
+# SSH into Public EC2 #1 and check access logs
+sudo tail -f /var/log/nginx/access.log
+```
+
+The CLB distributes requests in **round-robin** order across both public EC2s.
+
+---
+
+## Troubleshooting Guide
+
+### Cannot SSH into the Public EC2
+- ✅ Is the instance in **Running** state with **2/2 status checks passed**?
+- ✅ Did you use the **Public IPv4 address** (not the private IP)?
+- ✅ Are you using username **`ubuntu`** (NOT `ec2-user`)?
+- ✅ Does `PublicEC2SG` allow **SSH (port 22)** inbound?
+- ✅ Is the `.pem` file permissions set to `400`? (`chmod 400 key.pem`)
+
+### Cannot SSH from Public EC2 to Private EC2
+- ✅ Did you copy the `.pem` file to the public EC2 using SCP?
+- ✅ Did you run `chmod 400` on the key on the public EC2?
+- ✅ Does `PrivateEC2SG` allow **SSH (port 22)** from `PublicEC2SG`?
+- ✅ Are you using the **Private IP** (`10.0.3.xxx`), not a public IP?
+- ✅ Are you using username **`ubuntu`**?
+
+### Nginx is Not Running
+```bash
+sudo systemctl status nginx          # Check status
+sudo systemctl start nginx           # Start if stopped
+sudo apt-get install -y nginx        # Re-install if missing
+sudo nginx -t                        # Check config for errors
+```
+
+### CLB Shows "No healthy instances"
+- ✅ Are both EC2 instances showing **InService** in CLB → Instances tab?
+- ✅ Does `PublicEC2SG` allow **HTTP (port 80)** from `CLBSG`?
+- ✅ Is Nginx running on both public EC2s? (`sudo systemctl status nginx`)
+- ✅ Is the health check path (`/`) returning HTTP 200?
+
+### Browser Shows CLB Default Page Instead of Your HTML
+- ✅ Did you configure the Nginx reverse proxy on **both** public EC2s?
+- ✅ Did you replace `PRIVATE_EC2_IP` with the actual IP in the proxy config?
+- ✅ Run `sudo nginx -t` — should say `syntax is ok`
+- ✅ Run `sudo systemctl reload nginx` after any config changes
+
+### Private EC2 Cannot Install Packages (apt-get fails)
+- ✅ Is the NAT Gateway status **Available**?
+- ✅ Does `PrivateRT` have route `0.0.0.0/0` → NAT Gateway?
+- ✅ Is `PrivateSubnet` associated with `PrivateRT` (not the main route table)?
+
+### User Data Script Did Not Run
+- ✅ Did you paste the script with the `#!/bin/bash` line at the top?
+- ✅ Check logs: `cat /var/log/cloud-init-output.log` on the public EC2
+- ✅ Is Nginx installed? Run: `nginx -v`
+
+---
+
+## Lab Submission Checklist
+
+Take a screenshot of each item before submitting:
+
+- [ ] `MyLabVPC` in the VPC console showing CIDR `10.0.0.0/16`
+- [ ] All 3 subnets listed (PublicSubnetA, PublicSubnetB, PrivateSubnet)
+- [ ] `MyLabIGW` showing **Attached** state
+- [ ] `MyLabNATGW` showing **Available** state
+- [ ] `PublicRT` routes showing `0.0.0.0/0` → IGW
+- [ ] `PrivateRT` routes showing `0.0.0.0/0` → NAT Gateway
+- [ ] `NginxLaunchTemplate` in the Launch Templates list
+- [ ] `MyLabASG` showing **2/2 instances** running
+- [ ] `MyLabCLB` showing both instances as **InService**
+- [ ] Both public EC2 instances in the **Instances** list with public IPs
+- [ ] `PrivateEC2` in the Instances list with **no public IP**
+- [ ] Terminal showing successful SSH from public EC2 to private EC2
+- [ ] `sudo systemctl status nginx` on the private EC2 showing **active (running)**
+- [ ] `curl http://localhost` on the private EC2 showing HTML output
+- [ ] `sudo nginx -t` on a public EC2 showing **syntax is ok**
+- [ ] The HTML page loaded in your browser via the **CLB DNS name**
+
+---
+
+## Clean Up (IMPORTANT)
+
+> ⚠️ AWS charges for all of the below resources. **Delete everything** after the lab to avoid ongoing charges. The NAT Gateway and CLB are the most expensive — delete these first.
+
+### Delete in this exact order:
+
+1. **Auto Scaling Group** — EC2 → Auto Scaling Groups → Select `MyLabASG` → Delete  
+   *(This will also terminate the 2 public EC2 instances automatically)*
+
+2. **Classic Load Balancer** — EC2 → Load Balancers → Select `MyLabCLB` → Actions → Delete
+
+3. **Private EC2** — EC2 → Instances → Select `PrivateEC2` → Instance State → Terminate
+
+4. **NAT Gateway** — VPC → NAT Gateways → Select `MyLabNATGW` → Actions → Delete NAT gateway  
+   *(Wait for status to show **Deleted** before next step)*
+
+5. **Elastic IP** — VPC → Elastic IPs → Select the IP → Actions → Release Elastic IP address
+
+6. **Internet Gateway** — VPC → Internet Gateways → Select `MyLabIGW` → Actions → Detach → then Delete
+
+7. **Subnets** — Delete PublicSubnetA, PublicSubnetB, and PrivateSubnet
+
+8. **Route Tables** — Delete `PublicRT` and `PrivateRT`
+
+9. **Security Groups** — Delete `CLBSG`, `PublicEC2SG`, `PrivateEC2SG`
+
+10. **Launch Template** — EC2 → Launch Templates → Delete `NginxLaunchTemplate`
+
+11. **VPC** — Delete `MyLabVPC`
+
+> ✅ Go to **EC2 → Instances** and confirm no instances are running.  
+> ✅ Go to **VPC → NAT Gateways** and confirm the NAT Gateway is deleted.  
+> ✅ Go to **EC2 → Load Balancers** and confirm the CLB is deleted.
+
+---
+
+*End of Lab — Well done! 🎉*
